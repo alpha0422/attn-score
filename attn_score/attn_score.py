@@ -4,7 +4,7 @@ import attn_score_cuda
 class AttentionScore(torch.autograd.Function):
     @staticmethod
     def forward(ctx, att_query, att_keys, bias, linear_att, tile_x=8, tile_y=8, ilp=1):
-        score = attn_score_cuda.forward(att_query, att_keys, bias, linear_att, tile_x, tile_y)
+        score = attn_score_cuda.forward(att_query, att_keys, bias, linear_att)
         ctx.save_for_backward(att_query, att_keys, linear_att, torch.IntTensor([ilp]))
         return score
 

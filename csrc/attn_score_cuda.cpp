@@ -8,17 +8,13 @@ at::Tensor attn_score_forward_cuda(
     const at::Tensor &attn_query,
     const at::Tensor &attn_keys,
     const at::Tensor &bias,
-    const at::Tensor &linear_attn,
-    const uint32_t tile_x,
-    const uint32_t tile_y);
+    const at::Tensor &linear_attn);
 
 std::vector<at::Tensor> attn_score_backward_cuda(
     const at::Tensor &grad_output,
     const at::Tensor &attn_query,
     const at::Tensor &attn_keys,
-    const at::Tensor &linear_attn,
-    const uint32_t tile_x,
-    const uint32_t tile_y);
+    const at::Tensor &linear_attn);
 
 // C++ interface
 
@@ -30,30 +26,26 @@ at::Tensor attn_score_forward(
     const at::Tensor &attn_query,
     const at::Tensor &attn_keys,
     const at::Tensor &bias,
-    const at::Tensor &linear_attn,
-    const uint32_t tile_x,
-    const uint32_t tile_y) {
+    const at::Tensor &linear_attn) {
     CHECK_INPUT(attn_query);
     CHECK_INPUT(attn_keys);
     CHECK_INPUT(bias);
     CHECK_INPUT(linear_attn);
 
-    return attn_score_forward_cuda(attn_query, attn_keys, bias, linear_attn, tile_x, tile_y);
+    return attn_score_forward_cuda(attn_query, attn_keys, bias, linear_attn);
 }
 
 std::vector<at::Tensor> attn_score_backward(
     const at::Tensor &grad_output,
     const at::Tensor &attn_query,
     const at::Tensor &attn_keys,
-    const at::Tensor &linear_attn,
-    const uint32_t tile_x,
-    const uint32_t tile_y) {
+    const at::Tensor &linear_attn) {
     CHECK_INPUT(grad_output);
     CHECK_INPUT(attn_query);
     CHECK_INPUT(attn_keys);
     CHECK_INPUT(linear_attn);
 
-    return attn_score_backward_cuda(grad_output, attn_query, attn_keys, linear_attn, tile_x, tile_y);
+    return attn_score_backward_cuda(grad_output, attn_query, attn_keys, linear_attn);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

@@ -391,24 +391,87 @@ Tensor host_softmax_backward(const Tensor &grad_, const Tensor &output_, int64_t
   return gI;
 }
 
+/** Each thread computes a vector of hidden size. */
+template <typename scalar_t, typename accscalar_t, typename outscalar_t>
+__global__ void
+cunn_AttnScoreForward(
+    outscalar_t *output,
+    scalar_t *attn_query,
+    scalar_t *attn_keys,
+    scalar_t *bias,
+    scalar_t *linear_attn,
+    int64_t t_q,
+    int64_t t_k,
+    int64_t hidden) {
+    __shared__ scalar_t q[32], k[32], b[32], l[32];
+    accscalar_t temp = 0.0f;
+
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int kid = tid % t_k;
+    int qid = tid / t_k % t_q;
+    int nid = tid / (t_q * t_k);
+
+    output += nid*t_q*t_k + kid*t_q + qid;
+    attn_query += (nid*t_q + qid) * hidden;
+    attn_keys += (nid*t_k + kid) * hidden;
+
+    for (int i=0; i<hidden/32; i+=32) {
+        #pragma unroll
+        for (int j=0; j<32; j++) {
+            q[j] = attn_query[i+j];
+            k[j] = attn_keys[i+j];
+            b[j] = bias[i+j];
+            l[j] = linear_attn[i+j];
+        }
+
+        #pragma unroll
+        for (int j=0; j<32; j++) {
+            accscalar_t s = static_cast<accscalar_t>(q[j]+k[j]+b[j]);
+            temp += tanhf(s) * l[j];
+        }
+    }
+
+    for (int i=hidden/32; i<hidden; i++) {
+        accscalar_t s = static_cast<accscalar_t>(attn_query[i]+attn_keys[i]+bias[i]);
+        temp += tanhf(s) * linear_attn[i];
+    }
+
+    *output = static_cast<outscalar_t>(temp);
+}
+
 at::Tensor attn_score_forward_cuda(
     const at::Tensor &attn_query,
     const at::Tensor &attn_keys,
     const at::Tensor &bias,
-    const at::Tensor &linear_attn,
-    const uint32_t tile_x,
-    const uint32_t tile_y) {
+    const at::Tensor &linear_attn) {
+    Tensor output = at::empty({attn_query.size(0), attn_query.size(1), attn_keys.size(1)}, attn_query.options());
+    int64_t n_elem = attn_query.size(0) * attn_query.size(1) * attn_keys.size(1);
+    int64_t hidden = attn_query.size(2);
 
-	return attn_query;
+    dim3 block(128);
+    dim3 grid((n_elem + block.x - 1) / block.x);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(attn_query.type(), "attn_score", [&] {
+        using accscalar_t = acc_type<scalar_t, true>;
+        cunn_AttnScoreForward<scalar_t, accscalar_t, scalar_t>
+        <<<grid, block, 0, stream>>>(
+            output.data<scalar_t>(), attn_query.data<scalar_t>(),
+            attn_keys.data<scalar_t>(), bias.data<scalar_t>(),
+            linear_attn.data<scalar_t>(), attn_query.size(1),
+            attn_keys.size(1), hidden
+        );
+    });
+
+    THCudaCheck(cudaGetLastError());
+	return output;
 }
 
 std::vector<at::Tensor> attn_score_backward_cuda(
     const at::Tensor &grad_output,
     const at::Tensor &attn_query,
     const at::Tensor &attn_keys,
-    const at::Tensor &linear_attn,
-    const uint32_t tile_x,
-    const uint32_t tile_y) {
+    const at::Tensor &linear_attn) {
 
 	std::vector<at::Tensor> ret = {grad_output};
 	return ret;	
