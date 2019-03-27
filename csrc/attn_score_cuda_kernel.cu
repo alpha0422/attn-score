@@ -392,7 +392,7 @@ Tensor host_softmax_backward(const Tensor &grad_, const Tensor &output_, int64_t
 }
 
 /** Each thread computes a vector of hidden size. */
-template <typename scalar_t, typename accscalar_t, typename outscalar_t>
+template <int ILP, typename scalar_t, typename accscalar_t, typename outscalar_t>
 __global__ void
 cunn_AttnScoreForward(
     outscalar_t *output,
@@ -403,40 +403,54 @@ cunn_AttnScoreForward(
     int64_t t_q,
     int64_t t_k,
     int64_t hidden) {
-    __shared__ scalar_t q[32], k[32], b[32], l[32];
-    accscalar_t temp = 0.0f;
+    
+    extern __shared__ unsigned char smem[];
+    auto sdata = reinterpret_cast<accscalar_t*>(smem);
 
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int kid = tid % t_k;
-    int qid = tid / t_k % t_q;
-    int nid = tid / (t_q * t_k);
+    int kid = blockIdx.x % t_k;
+    int qid = blockIdx.x / t_k % t_q;
+    int nid = blockIdx.x / (t_q * t_k);
 
     output += nid*t_q*t_k + kid*t_q + qid;
     attn_query += (nid*t_q + qid) * hidden;
     attn_keys += (nid*t_k + kid) * hidden;
 
-    for (int i=0; i<hidden/32; i+=32) {
+    // ilpReduce
+    accscalar_t threadVal = static_cast<accscalar_t>(0);
+    int offset = threadIdx.x;
+    int last = hidden % (ILP * blockDim.x);
+
+    // Body (unroll by ILP times)
+    for (; offset < hidden - last; offset += blockDim.x * ILP) {
+        scalar_t tmp_q[ILP], tmp_k[ILP], tmp_b[ILP], tmp_l[ILP];
+
         #pragma unroll
-        for (int j=0; j<32; j++) {
-            q[j] = attn_query[i+j];
-            k[j] = attn_keys[i+j];
-            b[j] = bias[i+j];
-            l[j] = linear_attn[i+j];
+        for (int j = 0; j < ILP; ++j) {
+            tmp_q[j] = attn_query[offset + j * blockDim.x];
+            tmp_k[j] = attn_keys[offset + j * blockDim.x];
+            tmp_b[j] = bias[offset + j * blockDim.x];
+            tmp_l[j] = linear_attn[offset + j * blockDim.x];
         }
 
         #pragma unroll
-        for (int j=0; j<32; j++) {
-            accscalar_t s = static_cast<accscalar_t>(q[j]+k[j]+b[j]);
-            temp += tanhf(s) * l[j];
+        for (int j = 0; j < ILP; ++j) {
+            accscalar_t s = static_cast<accscalar_t>(tmp_q[j]+tmp_k[j]+tmp_b[j]);
+            threadVal += tanhf(s) * tmp_l[j];
         }
     }
 
-    for (int i=hidden/32; i<hidden; i++) {
-        accscalar_t s = static_cast<accscalar_t>(attn_query[i]+attn_keys[i]+bias[i]);
-        temp += tanhf(s) * linear_attn[i];
+    // Epilogue
+    for (; offset < hidden; offset += blockDim.x) {
+        accscalar_t s = static_cast<accscalar_t>(attn_query[offset]+
+            attn_keys[offset]+bias[offset]);
+        threadVal += tanhf(s) * linear_attn[offset];
     }
 
-    *output = static_cast<outscalar_t>(temp);
+    // blockReduce
+    accscalar_t sumAll = blockReduce<Add, accscalar_t>(
+      sdata, threadVal, Add<accscalar_t>(), static_cast<accscalar_t>(0));
+
+    *output = static_cast<outscalar_t>(sumAll);
 }
 
 at::Tensor attn_score_forward_cuda(
@@ -448,14 +462,15 @@ at::Tensor attn_score_forward_cuda(
     int64_t n_elem = attn_query.size(0) * attn_query.size(1) * attn_keys.size(1);
     int64_t hidden = attn_query.size(2);
 
+    const int ILP = 2;
     dim3 block(128);
-    dim3 grid((n_elem + block.x - 1) / block.x);
+    dim3 grid(n_elem);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(attn_query.type(), "attn_score", [&] {
         using accscalar_t = acc_type<scalar_t, true>;
-        cunn_AttnScoreForward<scalar_t, accscalar_t, scalar_t>
-        <<<grid, block, 0, stream>>>(
+        cunn_AttnScoreForward<ILP, scalar_t, accscalar_t, scalar_t>
+        <<<grid, block, block.x * sizeof(accscalar_t), stream>>>(
             output.data<scalar_t>(), attn_query.data<scalar_t>(),
             attn_keys.data<scalar_t>(), bias.data<scalar_t>(),
             linear_attn.data<scalar_t>(), attn_query.size(1),
