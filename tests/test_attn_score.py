@@ -36,10 +36,10 @@ class AttentionScoreTest(unittest.TestCase):
         normalize_bias_ref = torch.randn([hidden_size], **options)
         linear_att_ref = torch.randn([hidden_size], **options)
 
-        att_query_tst = att_query_ref.clone().detach()
-        att_keys_tst = att_keys_ref.clone().detach()
-        normalize_bias_tst = normalize_bias_ref.clone().detach()
-        linear_att_tst = linear_att_ref.clone().detach()
+        att_query_tst = att_query_ref.clone().detach().requires_grad_()
+        att_keys_tst = att_keys_ref.clone().detach().requires_grad_()
+        normalize_bias_tst = normalize_bias_ref.clone().detach().requires_grad_()
+        linear_att_tst = linear_att_ref.clone().detach().requires_grad_()
 
         return (att_query_ref, att_keys_ref, normalize_bias_ref, linear_att_ref), \
             (att_query_tst, att_keys_tst, normalize_bias_tst, linear_att_tst), grads
@@ -62,7 +62,6 @@ class AttentionScoreTest(unittest.TestCase):
     def test_attn_score_perf(self):
         num_iters = 1000
         inputs_ref, inputs_tst, grads = self.gen_test_inputs()
-        
 
         torch.cuda.synchronize()
         ts_ref = time.time()
