@@ -488,14 +488,12 @@ std::vector<at::Tensor> attn_score_backward_cuda(
     const at::Tensor &attn_keys,
     const at::Tensor &bias,
     const at::Tensor &linear_attn) {
-    Tensor grad_query = at::empty_like(attn_query);
-    Tensor grad_keys = at::empty_like(attn_keys);
-    Tensor grad_bias = at::empty_like(bias);
-    Tensor grad_lin = at::empty_like(linear_attn);
+    Tensor grad_query = at::zeros_like(attn_query);
+    Tensor grad_keys = at::zeros_like(attn_keys);
+    Tensor grad_bias = at::zeros_like(bias);
+    Tensor grad_lin = at::zeros_like(linear_attn);
 
-    dim3 block();
-
-	std::vector<at::Tensor> ret = {grad_output};
+	std::vector<at::Tensor> ret = {grad_query, grad_keys, grad_bias, grad_lin};
 	return ret;	
 }
 
