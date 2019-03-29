@@ -17,6 +17,16 @@
 #include <THC/THCGeneral.h>
 #include <THC/THCThrustAllocator.cuh>
 
+#if 0
+#define DPRINTF(fmt, args...)                        \
+    do{                                             \
+        fprintf(stderr, "DEBUG: %s:%d:%s(): " fmt,  \
+            __FILE__, __LINE__, __func__, ##args);  \
+    } while(false)
+#else
+#define DPRINTF(fmt, args...) do{ } while (false)
+#endif
+
 using Tensor = at::Tensor;
 using TensorList = at::TensorList;
 using ScalarType = at::ScalarType;
@@ -391,8 +401,8 @@ Tensor host_softmax_backward(const Tensor &grad_, const Tensor &output_, int64_t
   return gI;
 }
 
-/** Each thread computes a vector of hidden size. */
-template <int ILP, typename scalar_t, typename accscalar_t, typename outscalar_t>
+/** Each block process TILE_Q*TILE_K*hidden volumn. */
+template <int TILE, typename scalar_t, typename accscalar_t, typename outscalar_t>
 __global__ void
 cunn_AttnScoreForward(
     outscalar_t *output,
@@ -400,57 +410,129 @@ cunn_AttnScoreForward(
     const scalar_t* __restrict__ attn_keys,
     const scalar_t* __restrict__ bias,
     const scalar_t* __restrict__ linear_attn,
-    int64_t t_q,
-    int64_t t_k,
-    int64_t hidden) {
+    int t_q,
+    int t_k,
+    int hidden) {
     
     extern __shared__ unsigned char smem[];
-    auto sdata = reinterpret_cast<accscalar_t*>(smem);
+    auto tmp_q = reinterpret_cast<scalar_t*>(smem);
+    auto tmp_k = tmp_q + TILE * blockDim.x;
+    auto tmp_b = tmp_k + TILE * blockDim.x;
+    auto tmp_l = tmp_b + blockDim.x;
+    auto tmp_o = reinterpret_cast<accscalar_t*>(tmp_l + blockDim.x);
 
-    int kid = blockIdx.x % t_k;
-    int qid = blockIdx.x / t_k % t_q;
-    int nid = blockIdx.x / (t_q * t_k);
+    int batch_id = blockIdx.x;
+    int q_start = blockIdx.y * TILE;
+    int k_start = blockIdx.z * TILE;
+    
+    attn_query += batch_id*t_q*hidden + q_start*hidden;
+    attn_keys += batch_id*t_k*hidden + k_start*hidden;
+    output += batch_id*t_q*t_k;
 
-    output += nid*t_q*t_k + kid*t_q + qid;
-    attn_query += (nid*t_q + qid) * hidden;
-    attn_keys += (nid*t_k + kid) * hidden;
+    // initialize intermediate result
+    #pragma unroll
+    for (int i = 0; i < TILE; i++)
+        #pragma unroll
+        for (int j = 0; j < TILE; j++)
+            tmp_o[i*TILE*blockDim.x+j*blockDim.x+threadIdx.x] = static_cast<accscalar_t>(0);
 
     // ilpReduce
-    accscalar_t threadVal = static_cast<accscalar_t>(0);
     int offset = threadIdx.x;
-    int last = hidden % (ILP * blockDim.x);
+    int last = hidden % blockDim.x;
 
-    // Body (unroll by ILP times)
-    for (; offset < hidden - last; offset += blockDim.x * ILP) {
-        scalar_t tmp_q[ILP], tmp_k[ILP], tmp_b[ILP], tmp_l[ILP];
+    // ilpReduce on regular data
+    for (; offset < hidden - last; offset += blockDim.x) {
+        // prolog: load query slices to shared memory
+        for (int i = 0; i < t_q - q_start && i < TILE; i++)
+            tmp_q[i*blockDim.x+threadIdx.x] = attn_query[i*hidden+offset];
 
-        #pragma unroll
-        for (int j = 0; j < ILP; ++j) {
-            tmp_q[j] = attn_query[offset + j * blockDim.x];
-            tmp_k[j] = attn_keys[offset + j * blockDim.x];
-            tmp_b[j] = bias[offset + j * blockDim.x];
-            tmp_l[j] = linear_attn[offset + j * blockDim.x];
-        }
+        // prolog: load key slices to shared memory
+        for (int i = 0; i < t_k - k_start && i < TILE; i++)
+            tmp_k[i*blockDim.x+threadIdx.x] = attn_keys[i*hidden+offset];
 
-        #pragma unroll
-        for (int j = 0; j < ILP; ++j) {
-            accscalar_t s = static_cast<accscalar_t>(tmp_q[j]+tmp_k[j]+tmp_b[j]);
-            threadVal += tanhf(s) * tmp_l[j];
+        // prolog: load bias and linear_attn slices to shared memory
+        tmp_b[threadIdx.x] = bias[offset];
+        tmp_l[threadIdx.x] = linear_attn[offset];
+
+        // main loop
+        for (int i = 0; i < t_q - q_start && i < TILE; i++) {
+            for (int j = 0; j < t_k - k_start && j < TILE; j++) {
+                accscalar_t s = static_cast<accscalar_t>(
+                    tmp_q[i*blockDim.x+threadIdx.x] +
+                    tmp_k[j*blockDim.x+threadIdx.x] +
+                    tmp_b[threadIdx.x]);
+                tmp_o[i*TILE*blockDim.x+j*blockDim.x+threadIdx.x] += tanhf(s) * tmp_l[threadIdx.x];
+                DPRINTF("threadVal: %d %d %f\n", i, j, tanhf(s) * tmp_l[threadIdx.x]);
+            }
         }
     }
 
-    // Epilogue
+    // ilpReduce on boundary
     for (; offset < hidden; offset += blockDim.x) {
-        accscalar_t s = static_cast<accscalar_t>(attn_query[offset]+
-            attn_keys[offset]+bias[offset]);
-        threadVal += tanhf(s) * linear_attn[offset];
+        // prolog: load query slices to shared memory
+        for (int i = 0; i < t_q - q_start && i < TILE; i++)
+            tmp_q[i*blockDim.x+threadIdx.x] = attn_query[i*hidden+offset];
+
+        // prolog: load key slices to shared memory
+        for (int i = 0; i < t_k - k_start && i < TILE; i++)
+            tmp_k[i*blockDim.x+threadIdx.x] = attn_keys[i*hidden+offset];
+
+        // prolog: load bias and linear_attn slices to shared memory
+        tmp_b[threadIdx.x] = bias[offset];
+        tmp_l[threadIdx.x] = linear_attn[offset];
+
+        // main loop
+        for (int i = 0; i < t_q - q_start && i < TILE; i++) {
+            for (int j = 0; j < t_k - k_start && j < TILE; j++) {
+                accscalar_t s = static_cast<accscalar_t>(
+                    tmp_q[i*blockDim.x+threadIdx.x] +
+                    tmp_k[j*blockDim.x+threadIdx.x] +
+                    tmp_b[threadIdx.x]);
+                tmp_o[i*TILE*blockDim.x+j*blockDim.x+threadIdx.x] += tanhf(s) * tmp_l[threadIdx.x];
+            }
+        }
     }
 
     // blockReduce
-    accscalar_t sumAll = blockReduce<Add, accscalar_t>(
-      sdata, threadVal, Add<accscalar_t>(), static_cast<accscalar_t>(0));
+    __syncthreads();
 
-    *output = static_cast<outscalar_t>(sumAll);
+    // First warp will perform per-warp reductions for the remaining warps
+    if (threadIdx.x < 32) {
+        int lane = threadIdx.x % 32;
+        if (lane < blockDim.x / 32) {
+            for (int i = 0; i < t_q - q_start && i < TILE; i++) {
+                for (int j = 0; j < t_k - k_start && j < TILE; j++) {
+                    accscalar_t warpVal = static_cast<accscalar_t>(0);
+                    #pragma unroll
+                    for (int k = 0; k < 32; ++k) {
+                        DPRINTF("warpVal: %d %d %d %d %f %f\n", lane, i, j, k, tmp_o[i*TILE*blockDim.x+j*blockDim.x+lane*32+k], warpVal);
+                        warpVal += tmp_o[i*TILE*blockDim.x+j*blockDim.x+lane*32+k];
+                    }
+                    tmp_o[i*TILE*blockDim.x+j*blockDim.x+lane] = warpVal;
+                    DPRINTF("warpVal: %d %d %d %f\n", lane, i, j, warpVal);
+                }
+            }
+        }
+    }
+
+    __syncthreads();
+
+    // First thread will perform a reduction of the above per-warp reductions
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < t_q - q_start && i < TILE; i++) {
+            for (int j = 0; j < t_k - k_start && j < TILE; j++) {
+                accscalar_t blockVal = static_cast<accscalar_t>(0);
+                for (int k = 0; k < blockDim.x / 32; ++k) {
+                    blockVal += tmp_o[i*TILE*blockDim.x+j*blockDim.x+k];
+                }
+                output[(i+q_start)*t_k+(j+k_start)] = static_cast<outscalar_t>(blockVal);
+                DPRINTF("blockVal: %d %d %f\n", i, j, blockVal);
+            }
+        }
+    }
+
+    // Sync and broadcast
+    __syncthreads();
 }
 
 at::Tensor attn_score_forward_cuda(
@@ -458,23 +540,35 @@ at::Tensor attn_score_forward_cuda(
     const at::Tensor &attn_keys,
     const at::Tensor &bias,
     const at::Tensor &linear_attn) {
-    Tensor output = at::empty({attn_query.size(0), attn_query.size(1), attn_keys.size(1)}, attn_query.options());
-    int64_t n_elem = attn_query.size(0) * attn_query.size(1) * attn_keys.size(1);
-    int64_t hidden = attn_query.size(2);
+    int batch_sz = attn_query.size(0);
+    int t_q = attn_query.size(1);
+    int t_k = attn_keys.size(1);
+    int hidden = attn_query.size(2);
 
-    const int ILP = 2;
+    Tensor output = at::empty({batch_sz, t_q, t_k}, attn_query.options());
+
+    const int TILE = 4;
+    int grid_x = batch_sz;
+    int grid_y = (t_q + TILE - 1) / TILE;
+    int grid_z = (t_k + TILE - 1) / TILE;
+
+    // Each block process TILE_Q*TILE_K*hidden volumn. 
     dim3 block(128);
-    dim3 grid(n_elem);
+    dim3 grid(grid_x, grid_y, grid_z);
+
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+    // Each block load (TILE_Q+TILE_K)*block.x volumn each time
+    // Each block load block.x volumn bias and linear_attn
+    // Each thread reserve its local results for intra block reduction
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(attn_query.type(), "attn_score", [&] {
         using accscalar_t = acc_type<scalar_t, true>;
-        cunn_AttnScoreForward<ILP, scalar_t, accscalar_t, scalar_t>
-        <<<grid, block, block.x * sizeof(accscalar_t), stream>>>(
+        cunn_AttnScoreForward<TILE, scalar_t, accscalar_t, scalar_t>
+        <<<grid, block, (2*TILE+2)*block.x * sizeof(scalar_t)+
+            block.x * TILE * TILE * sizeof(accscalar_t), stream>>>(
             output.data<scalar_t>(), attn_query.data<scalar_t>(),
             attn_keys.data<scalar_t>(), bias.data<scalar_t>(),
-            linear_attn.data<scalar_t>(), attn_query.size(1),
-            attn_keys.size(1), hidden
+            linear_attn.data<scalar_t>(), t_q, t_k, hidden
         );
     });
 
