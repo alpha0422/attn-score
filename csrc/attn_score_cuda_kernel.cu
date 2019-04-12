@@ -18,7 +18,7 @@
 #include <THC/THCThrustAllocator.cuh>
 
 #if 0
-#define DPRINTF(fmt, args...)                        \
+#define DPRINTF(fmt, args...)                       \
     do{                                             \
         fprintf(stderr, "DEBUG: %s:%d:%s(): " fmt,  \
             __FILE__, __LINE__, __func__, ##args);  \
@@ -434,7 +434,7 @@ cunn_AttnScoreForward(
     for (int i = 0; i < TILE; i++)
         #pragma unroll
         for (int j = 0; j < TILE; j++)
-            tmp_o[i*TILE*blockDim.x+j*blockDim.x+threadIdx.x] = static_cast<accscalar_t>(0);
+            tmp_o[i*TILE*blockDim.x+j*blockDim.x+threadIdx.x] = 0;
 
     // ilpReduce
     int offset = threadIdx.x;
@@ -561,7 +561,7 @@ at::Tensor attn_score_forward_cuda(
     // Each block load (TILE_Q+TILE_K)*block.x volumn each time
     // Each block load block.x volumn bias and linear_attn
     // Each thread reserve its local results for intra block reduction
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(attn_query.type(), "attn_score", [&] {
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(attn_query.type(), "attn_score_fprop", [&] {
         using accscalar_t = acc_type<scalar_t, true>;
         cunn_AttnScoreForward<TILE, scalar_t, accscalar_t, scalar_t>
         <<<grid, block, (2*TILE+2)*block.x * sizeof(scalar_t)+
@@ -576,17 +576,297 @@ at::Tensor attn_score_forward_cuda(
 	return output;
 }
 
+/**
+ * Each block process batch_sz*t_q*t_k*ILP volumn.
+ * Each thread process TILE*TILE*ILP volumn a time.
+ */
+template <int LEN, int TILE, int BZ, typename scalar_t, typename accscalar_t, typename outscalar_t>
+__global__ void
+cunn_AttnScoreBackward(
+    outscalar_t *grad_query,
+    outscalar_t *grad_keys,
+    outscalar_t *grad_bias,
+    outscalar_t *grad_lin,
+    const scalar_t* __restrict__ grad_output,
+    const scalar_t* __restrict__ attn_query,
+    const scalar_t* __restrict__ attn_keys,
+    const scalar_t* __restrict__ bias,
+    const scalar_t* __restrict__ linear_attn,
+    int batch_sz,
+    int t_q,
+    int t_k,
+    int hidden) {
+
+    extern __shared__ unsigned char smem[];
+    auto tmp_qk = reinterpret_cast<accscalar_t*>(smem);
+    auto tmp_it = tmp_qk + TILE * TILE * LEN;
+    auto tmp_gq = tmp_it + TILE * TILE * LEN;
+    auto tmp_gk = tmp_gq + t_q * LEN;
+    auto tmp_gb = tmp_gk + t_k * LEN;
+    auto tmp_gl = tmp_gb + blockDim.x;
+    auto tmp_q = reinterpret_cast<scalar_t*>(tmp_gl + blockDim.x);
+    auto tmp_k = tmp_q + t_q * LEN;
+    auto tmp_b = tmp_k + t_k * LEN;
+    auto tmp_l = tmp_b + LEN;
+
+    // initialize gradients to zero
+    assert(LEN < blockDim.x);
+    tmp_gl[threadIdx.x] = 0;
+    tmp_gb[threadIdx.x] = 0;
+
+    // update pointer to hidden volume offset
+    attn_query += blockIdx.x * LEN;
+    attn_keys += blockIdx.x * LEN;
+    bias += blockIdx.x * LEN;
+    linear_attn += blockIdx.x * LEN;
+
+    // load bias volume to shared memory
+    for (int i=threadIdx.x; i<LEN; i+=blockDim.x) {
+        tmp_b[i] = bias[i];
+        tmp_l[i] = linear_attn[i];
+    }
+
+    for (int n=0; n<batch_sz; n++) {
+        // initialize gradients to zero
+        for (int i=threadIdx.x; i<t_q*LEN; i+=blockDim.x)
+            tmp_gq[i] = 0;
+        for (int i=threadIdx.x; i<t_k*LEN; i+=blockDim.x)
+            tmp_gk[i] = 0;
+
+        // load batch specific data to shared memory
+        for (int i=threadIdx.x; i<t_q*LEN; i+=blockDim.x)
+            tmp_q[i] = attn_query[i];
+        for (int i=threadIdx.x; i<t_k*LEN; i+=blockDim.x)
+            tmp_k[i] = attn_keys[i];
+
+        __syncthreads();
+
+        // loop on each tile
+        for (int i=0; i<t_q; i+=TILE) {
+            for (int j=0; j<t_k; j+=TILE) {
+                // main loop
+                for (int k=threadIdx.x; k<TILE*TILE*LEN; k+=blockDim.x) {
+                    int h_id = k % LEN;
+                    int k_id = k / LEN % TILE;
+                    int q_id = k / TILE / LEN;
+
+                    accscalar_t s = 0, t = 0;
+                    // re-compute fprop intermediate result
+                    if (k_id + j < t_k && q_id + i < t_q) {
+                        scalar_t go = grad_output[(q_id+i)*t_k+k_id+j];
+                        t = static_cast<scalar_t>(tmp_q[(i + q_id) * LEN + h_id] +
+                            tmp_k[(j + k_id) * LEN + h_id] + tmp_b[h_id]);
+                        t = static_cast<scalar_t>(tanhf(t));
+                        s = t * go;
+                        t = static_cast<scalar_t>(tmp_l[h_id] * go * (1.f - t * t));
+                    }
+                    tmp_qk[k] = s;
+                    tmp_it[k] = t;
+                    //if (blockIdx.x == 0)
+                    //    printf("%d:%d, %d:%d:%d:%d, %d:%d:%d, tmp_qk: %f\n",
+                    //        blockIdx.x, threadIdx.x, n, i, j, k, q_id, k_id, h_id,
+                    //        static_cast<float>(tmp_qk[k]));
+                }
+
+                __syncthreads();
+
+#if 0
+                // reduction on linear attention gradients
+                unsigned int tid = threadIdx.x;
+                if (blockDim.x >= 1024 && tid < 512 && tid + 512 < TILE*TILE*LEN)
+                    tmp_qk[tid] += tmp_qk[tid + 512];
+                __syncthreads();
+                if (blockDim.x >= 512 && tid < 256 && tid + 256 < TILE*TILE*LEN)
+                    tmp_qk[tid] += tmp_qk[tid + 256];
+                __syncthreads();
+                if (blockDim.x >= 256 && tid < 128 && tid + 128 < TILE*TILE*LEN)
+                    tmp_qk[tid] += tmp_qk[tid + 128];
+                __syncthreads();
+                if (blockDim.x >= 128 && tid < 64 && tid + 64 < TILE*TILE*LEN)
+                    tmp_qk[tid] += tmp_qk[tid + 64];
+                __syncthreads();
+
+                //if (blockIdx.x == 0 && threadIdx.x < LEN)
+                //    printf("B: %d:%d:%d, tmp_gl[%d]: %f\n",
+                //        n, i, j, threadIdx.x, static_cast<float>(tmp_gl[threadIdx.x]));
+
+                static_assert(LEN < 32, "LEN too large.");
+                if (tid < 32) {
+                    volatile accscalar_t *vsmem = tmp_qk;
+                    #pragma unroll
+                    for (int m=32; m>=LEN; m>>=1) {
+                        //if (blockIdx.x == 0)
+                        //    printf("%d:%d, %d:%d:%d, vsmem[%d]: %f, vsmem[%d]: %f\n",
+                        //        blockIdx.x, threadIdx.x, n, i, j,
+                        //        tid, static_cast<float>(vsmem[tid]),
+                        //        tid+m, static_cast<float>(vsmem[tid + m]));
+                        vsmem[tid] += vsmem[tid + m];
+                    }
+                }
+                if (tid < LEN)  {
+                    //if (blockIdx.x == 0)
+                    //    printf("%d:%d, %d:%d:%d, tmp_gl[%d]: %f, tmp_qk[%d]: %f\n",
+                    //        blockIdx.x, threadIdx.x, n, i, j,
+                    //        tid, static_cast<float>(tmp_gl[tid]),
+                    //        tid, static_cast<float>(tmp_qk[tid]));
+                    tmp_gl[tid] += tmp_qk[tid];
+                }
+                __syncthreads();
+#endif
+
+                // reduction on query and key gradients
+                for (int k=threadIdx.x; k<TILE*LEN; k+=blockDim.x) {
+                    int h_id = k % LEN;
+                    int qkid = k / LEN;
+
+                    accscalar_t g_q = 0, g_k = 0, g_l = 0;
+
+                    #pragma unroll
+                    for (int m=0; m<TILE; m++) {
+                        //if (blockIdx.x == 0)
+                        //    printf("%d:%d, %d:%d:%d:%d:%d, g_q: %f, tmp_it[%d]: %f\n",
+                        //        blockIdx.x, threadIdx.x, n, i, j, k, m, g_q,
+                        //        m*TILE*LEN+qkid*LEN+h_id, 
+                        //        static_cast<float>(tmp_it[m*TILE*LEN+qkid*LEN+h_id]));
+                        g_q += tmp_it[qkid*TILE*LEN+m*LEN+h_id];
+                        g_k += tmp_it[m*TILE*LEN+qkid*LEN+h_id];
+                        g_l += tmp_qk[qkid*TILE*LEN+m*LEN+h_id];
+                    }
+                    
+                    if (i + qkid < t_q)  tmp_gq[(i+qkid)*LEN+h_id] += g_q;
+                    if (j + qkid < t_k)  tmp_gk[(j+qkid)*LEN+h_id] += g_k;
+                    tmp_gl[threadIdx.x] += g_l;
+                    tmp_gb[threadIdx.x] += 0.5f * (g_q + g_k);
+                }
+                __syncthreads();
+
+#if 0
+                // reduction on bias gradients
+                if (blockDim.x >= 1024 && tid < 512 && tid + 512 < TILE*TILE*LEN)
+                    tmp_it[tid] += tmp_it[tid + 512];
+                __syncthreads();
+                if (blockDim.x >= 512 && tid < 256 && tid + 256 < TILE*TILE*LEN)
+                    tmp_it[tid] += tmp_it[tid + 256];
+                __syncthreads();
+                if (blockDim.x >= 256 && tid < 128 && tid + 128 < TILE*TILE*LEN)
+                    tmp_it[tid] += tmp_it[tid + 128];
+                __syncthreads();
+                if (blockDim.x >= 128 && tid < 64 && tid + 64 < TILE*TILE*LEN)
+                    tmp_it[tid] += tmp_it[tid + 64];
+                __syncthreads();
+                if (tid < 32) {
+                    volatile accscalar_t *vsmem = tmp_it;
+                    #pragma unroll
+                    for (int m=32; m>=LEN; m>>=1) {
+                        vsmem[tid] += vsmem[tid + m];
+                    }
+                }
+                if (tid < LEN)  tmp_gb[tid] += tmp_it[tid];
+#endif
+            }
+        }
+
+        __syncthreads();
+
+        // write query and keys gradients
+        for (int i=threadIdx.x; i<t_q*LEN; i+=blockDim.x) {
+            int q_id = i / LEN;
+            int h_id = i % LEN;
+            grad_query[n*t_q*hidden+q_id*hidden+blockIdx.x*LEN+h_id] = tmp_gq[i];
+        }
+        for (int i=threadIdx.x; i<t_k*LEN; i+=blockDim.x) {
+            int k_id = i / LEN;
+            int h_id = i % LEN;
+            grad_keys[n*t_k*hidden+k_id*hidden+blockIdx.x*LEN+h_id] = tmp_gk[i];
+        }
+
+        // update pointer for next batch
+        grad_output += t_q * t_k;
+        attn_query += t_q * hidden;
+        attn_keys += t_k * hidden;
+    }
+    
+    __syncthreads();
+
+    // reduction bias and linear_attn inside one block
+    unsigned int tid = threadIdx.x;
+    if (blockDim.x >= 1024 && tid < 512) {
+        tmp_gl[tid] += tmp_gl[tid + 512];
+        tmp_gb[tid] += tmp_gb[tid + 512];
+    }
+    __syncthreads();
+    if (blockDim.x >= 512 && tid < 256) {
+        tmp_gl[tid] += tmp_gl[tid + 256];
+        tmp_gb[tid] += tmp_gb[tid + 256];
+    }
+    __syncthreads();
+    if (blockDim.x >= 256 && tid < 128) {
+        tmp_gl[tid] += tmp_gl[tid + 128];
+        tmp_gb[tid] += tmp_gb[tid + 128];
+    }
+    __syncthreads();
+    if (blockDim.x >= 128 && tid < 64) {
+        tmp_gl[tid] += tmp_gl[tid + 64];
+        tmp_gb[tid] += tmp_gb[tid + 64];
+    }
+    __syncthreads();
+    static_assert(LEN < 32, "LEN too large.");
+    if (tid < 32) {
+        volatile accscalar_t *vsmem_gl = tmp_gl;
+        volatile accscalar_t *vsmem_gb = tmp_gb;
+        #pragma unroll
+        for (int m=32; m>=LEN; m>>=1) {
+            vsmem_gl[tid] += vsmem_gl[tid + m];
+            vsmem_gb[tid] += vsmem_gb[tid + m];
+        }
+    }
+    __syncthreads();
+    if (tid < LEN) {
+        grad_lin[blockIdx.x*LEN+tid] = tmp_gl[tid];
+        grad_bias[blockIdx.x*LEN+tid] = tmp_gb[tid];
+    }
+}
+
 std::vector<at::Tensor> attn_score_backward_cuda(
     const at::Tensor &grad_output,
     const at::Tensor &attn_query,
     const at::Tensor &attn_keys,
     const at::Tensor &bias,
     const at::Tensor &linear_attn) {
-    Tensor grad_query = at::zeros_like(attn_query);
-    Tensor grad_keys = at::zeros_like(attn_keys);
-    Tensor grad_bias = at::zeros_like(bias);
-    Tensor grad_lin = at::zeros_like(linear_attn);
 
+    int batch_sz = attn_query.size(0);
+    int t_q = attn_query.size(1);
+    int t_k = attn_keys.size(1);
+    int hidden = attn_query.size(2);
+
+    Tensor grad_query = at::empty_like(attn_query);
+    Tensor grad_keys = at::empty_like(attn_keys);
+    Tensor grad_bias = at::empty_like(bias);
+    Tensor grad_lin = at::empty_like(linear_attn);
+
+    const int BZ = 8;
+    const int TILE = 16;
+    const int LEN = 4;
+
+    dim3 block(128);
+    dim3 grid((hidden+LEN-1)/LEN);
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(attn_query.type(), "attn_score_bprop", [&] {
+        using accscalar_t = acc_type<scalar_t, true>;
+        cunn_AttnScoreBackward<LEN, TILE, BZ, scalar_t, accscalar_t, scalar_t>
+        <<<grid, block, (2*TILE*TILE + t_q + t_k + block.x) * LEN * sizeof(accscalar_t) +
+            (t_q + t_k + 2) * LEN * sizeof(scalar_t) , stream>>>(
+            grad_query.data<scalar_t>(), grad_keys.data<scalar_t>(),
+            grad_bias.data<scalar_t>(), grad_lin.data<scalar_t>(),
+            grad_output.data<scalar_t>(), attn_query.data<scalar_t>(),
+            attn_keys.data<scalar_t>(), bias.data<scalar_t>(),
+            linear_attn.data<scalar_t>(), batch_sz, t_q, t_k, hidden
+        );
+    });
+
+    THCudaCheck(cudaGetLastError());
 	std::vector<at::Tensor> ret = {grad_query, grad_keys, grad_bias, grad_lin};
 	return ret;	
 }
