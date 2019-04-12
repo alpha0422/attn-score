@@ -50,6 +50,13 @@ class AttentionScoreTest(unittest.TestCase):
             (att_query_jit, att_keys_jit, normalize_bias_jit, linear_att_jit), \
             (att_query_tst, att_keys_tst, normalize_bias_tst, linear_att_tst), grads
 
+    def print_max_diff_elem(self, ref, tst):
+        ref, tst = ref.flatten(), tst.flatten()
+        diff = (ref - tst).abs().max()
+        idx = (ref - tst).abs().argmax()
+        print("idx: {}, diff: {:.6f}, ref: {:.6f}, tst: {:.6f}".format(
+            idx, diff, ref[idx], tst[idx]))
+
     def test_attn_score_function(self):
         inputs_ref, inputs_jit, inputs_tst, grads = self.gen_test_inputs()
         print()
@@ -61,6 +68,7 @@ class AttentionScoreTest(unittest.TestCase):
             print("score_ref norm: {:.6f}".format(score_ref.norm().item()))
             print("score_tst norm: {:.6f}".format(score_tst.norm().item()))
 
+            self.print_max_diff_elem(score_ref, score_tst)
             self.assertTrue((score_ref.norm() - score_tst.norm()).abs().item() < 1e-3)
             #self.assertTrue(torch.allclose(score_ref, score_tst))
 
@@ -79,6 +87,12 @@ class AttentionScoreTest(unittest.TestCase):
             for t in inputs_tst:
                 print("{:.8f}".format(t.grad.float().norm().item()), end=' ')
             print()
+            
+            self.print_max_diff_elem(inputs_ref[3].grad, inputs_tst[3].grad)
+            self.print_max_diff_elem(inputs_ref[2].grad, inputs_tst[2].grad)
+            self.print_max_diff_elem(inputs_ref[1].grad, inputs_tst[1].grad)
+            self.print_max_diff_elem(inputs_ref[0].grad, inputs_tst[0].grad)
+            
             self.assertTrue(abs(norm_ref - norm_tst) < 1e-3)
 
     def test_attn_score_perf(self):
