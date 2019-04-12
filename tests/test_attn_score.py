@@ -27,7 +27,7 @@ class AttentionScoreTest(unittest.TestCase):
 
     def gen_test_inputs(self):
         options = {'device': 'cuda:0', 'dtype': torch.float16, 'requires_grad': True}
-        batch_size, t_q, t_k, hidden_size = 32, 33, 34, 1024
+        batch_size, t_q, t_k, hidden_size = 32, 74, 75, 1024
 
         grads = torch.randn([batch_size, t_q, t_k], **options)
 
@@ -36,39 +36,61 @@ class AttentionScoreTest(unittest.TestCase):
         normalize_bias_ref = torch.randn([hidden_size], **options)
         linear_att_ref = torch.randn([hidden_size], **options)
 
+        att_query_jit = att_query_ref.clone().detach().requires_grad_()
+        att_keys_jit = att_keys_ref.clone().detach().requires_grad_()
+        normalize_bias_jit = normalize_bias_ref.clone().detach().requires_grad_()
+        linear_att_jit = linear_att_ref.clone().detach().requires_grad_()
+
         att_query_tst = att_query_ref.clone().detach().requires_grad_()
         att_keys_tst = att_keys_ref.clone().detach().requires_grad_()
         normalize_bias_tst = normalize_bias_ref.clone().detach().requires_grad_()
         linear_att_tst = linear_att_ref.clone().detach().requires_grad_()
 
         return (att_query_ref, att_keys_ref, normalize_bias_ref, linear_att_ref), \
+            (att_query_jit, att_keys_jit, normalize_bias_jit, linear_att_jit), \
             (att_query_tst, att_keys_tst, normalize_bias_tst, linear_att_tst), grads
 
     def test_attn_score_function(self):
-        inputs_ref, inputs_tst, grads = self.gen_test_inputs()
+        inputs_ref, inputs_jit, inputs_tst, grads = self.gen_test_inputs()
+        print()
 
         for i in range(4):
             score_ref = calc_score_ref(*inputs_ref)
             score_tst = calc_score_tst(*inputs_tst)
 
-            self.assertTrue(score_ref.norm() - score_tst.norm() < 0.01)
+            print("score_ref norm: {:.6f}".format(score_ref.norm().item()))
+            print("score_tst norm: {:.6f}".format(score_tst.norm().item()))
+
+            self.assertTrue((score_ref.norm() - score_tst.norm()).abs().item() < 1e-3)
             #self.assertTrue(torch.allclose(score_ref, score_tst))
 
-            #score_ref.backward(grads)
-            #score_tst.backward(grads)
+            score_ref.backward(grads)
+            score_tst.backward(grads)
            
             #for t_ref, t_tst in zip(inputs_ref, inputs_tst):
             #    self.assertTrue(torch.allclose(t_ref.grad, t_tst.grad))
+            norm_ref = sum([x.grad.float().norm() for x in inputs_ref])
+            norm_tst = sum([x.grad.float().norm() for x in inputs_tst])
+            print("Ref norm:", end=' ')
+            for t in inputs_ref:
+                print("{:.8f}".format(t.grad.float().norm().item()), end=' ')
+            print()
+            print("Tst norm:", end=' ')
+            for t in inputs_tst:
+                print("{:.8f}".format(t.grad.float().norm().item()), end=' ')
+            print()
+            self.assertTrue(abs(norm_ref - norm_tst) < 1e-3)
 
     def test_attn_score_perf(self):
         num_iters = 1000
-        inputs_ref, inputs_tst, grads = self.gen_test_inputs()
+        inputs_ref, inputs_jit, inputs_tst, grads = self.gen_test_inputs()
+        print()
 
         torch.cuda.synchronize()
         ts_ref = time.time()
         for i in range(num_iters):
             score_ref = calc_score_ref(*inputs_ref)
-            #score_ref.backward(grads)
+            score_ref.backward(grads)
         torch.cuda.synchronize()
         td_ref = time.time()
         print("Ref time {:.2f} s elapsed for {} iterations".format(
@@ -77,8 +99,8 @@ class AttentionScoreTest(unittest.TestCase):
         torch.cuda.synchronize()
         ts_jit = time.time()
         for i in range(num_iters):
-            score_jit = calc_score_jit(*inputs_ref)
-            #score_jit.backward(grads)
+            score_jit = calc_score_jit(*inputs_jit)
+            score_jit.backward(grads)
         torch.cuda.synchronize()
         td_jit = time.time()
         print("JIT time {:.2f} s elapsed for {} iterations".format(
@@ -88,7 +110,7 @@ class AttentionScoreTest(unittest.TestCase):
         ts_tst = time.time()
         for i in range(num_iters):
             score_tst = calc_score_tst(*inputs_tst)
-            #score_tst.backward(grads)
+            score_tst.backward(grads)
         torch.cuda.synchronize()
         td_tst = time.time()
         print("Tst time {:.2f} s elapsed for {} iterations".format(
