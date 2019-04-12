@@ -615,8 +615,6 @@ cunn_AttnScoreBackward(
     tmp_gb[threadIdx.x] = 0;
 
     // update pointer to hidden volume offset
-    attn_query += blockIdx.x * LEN;
-    attn_keys += blockIdx.x * LEN;
     bias += blockIdx.x * LEN;
     linear_attn += blockIdx.x * LEN;
 
@@ -635,9 +633,9 @@ cunn_AttnScoreBackward(
 
         // load batch specific data to shared memory
         for (int i=threadIdx.x; i<t_q*LEN; i+=blockDim.x)
-            tmp_q[i] = attn_query[i];
+            tmp_q[i] = attn_query[i/LEN*hidden + blockIdx.x*LEN+i%LEN];
         for (int i=threadIdx.x; i<t_k*LEN; i+=blockDim.x)
-            tmp_k[i] = attn_keys[i];
+            tmp_k[i] = attn_keys[i/LEN*hidden + blockIdx.x*LEN+i%LEN];
 
         __syncthreads();
 
@@ -670,50 +668,6 @@ cunn_AttnScoreBackward(
 
                 __syncthreads();
 
-#if 0
-                // reduction on linear attention gradients
-                unsigned int tid = threadIdx.x;
-                if (blockDim.x >= 1024 && tid < 512 && tid + 512 < TILE*TILE*LEN)
-                    tmp_qk[tid] += tmp_qk[tid + 512];
-                __syncthreads();
-                if (blockDim.x >= 512 && tid < 256 && tid + 256 < TILE*TILE*LEN)
-                    tmp_qk[tid] += tmp_qk[tid + 256];
-                __syncthreads();
-                if (blockDim.x >= 256 && tid < 128 && tid + 128 < TILE*TILE*LEN)
-                    tmp_qk[tid] += tmp_qk[tid + 128];
-                __syncthreads();
-                if (blockDim.x >= 128 && tid < 64 && tid + 64 < TILE*TILE*LEN)
-                    tmp_qk[tid] += tmp_qk[tid + 64];
-                __syncthreads();
-
-                //if (blockIdx.x == 0 && threadIdx.x < LEN)
-                //    printf("B: %d:%d:%d, tmp_gl[%d]: %f\n",
-                //        n, i, j, threadIdx.x, static_cast<float>(tmp_gl[threadIdx.x]));
-
-                static_assert(LEN < 32, "LEN too large.");
-                if (tid < 32) {
-                    volatile accscalar_t *vsmem = tmp_qk;
-                    #pragma unroll
-                    for (int m=32; m>=LEN; m>>=1) {
-                        //if (blockIdx.x == 0)
-                        //    printf("%d:%d, %d:%d:%d, vsmem[%d]: %f, vsmem[%d]: %f\n",
-                        //        blockIdx.x, threadIdx.x, n, i, j,
-                        //        tid, static_cast<float>(vsmem[tid]),
-                        //        tid+m, static_cast<float>(vsmem[tid + m]));
-                        vsmem[tid] += vsmem[tid + m];
-                    }
-                }
-                if (tid < LEN)  {
-                    //if (blockIdx.x == 0)
-                    //    printf("%d:%d, %d:%d:%d, tmp_gl[%d]: %f, tmp_qk[%d]: %f\n",
-                    //        blockIdx.x, threadIdx.x, n, i, j,
-                    //        tid, static_cast<float>(tmp_gl[tid]),
-                    //        tid, static_cast<float>(tmp_qk[tid]));
-                    tmp_gl[tid] += tmp_qk[tid];
-                }
-                __syncthreads();
-#endif
-
                 // reduction on query and key gradients
                 for (int k=threadIdx.x; k<TILE*LEN; k+=blockDim.x) {
                     int h_id = k % LEN;
@@ -739,30 +693,6 @@ cunn_AttnScoreBackward(
                     tmp_gb[threadIdx.x] += 0.5f * (g_q + g_k);
                 }
                 __syncthreads();
-
-#if 0
-                // reduction on bias gradients
-                if (blockDim.x >= 1024 && tid < 512 && tid + 512 < TILE*TILE*LEN)
-                    tmp_it[tid] += tmp_it[tid + 512];
-                __syncthreads();
-                if (blockDim.x >= 512 && tid < 256 && tid + 256 < TILE*TILE*LEN)
-                    tmp_it[tid] += tmp_it[tid + 256];
-                __syncthreads();
-                if (blockDim.x >= 256 && tid < 128 && tid + 128 < TILE*TILE*LEN)
-                    tmp_it[tid] += tmp_it[tid + 128];
-                __syncthreads();
-                if (blockDim.x >= 128 && tid < 64 && tid + 64 < TILE*TILE*LEN)
-                    tmp_it[tid] += tmp_it[tid + 64];
-                __syncthreads();
-                if (tid < 32) {
-                    volatile accscalar_t *vsmem = tmp_it;
-                    #pragma unroll
-                    for (int m=32; m>=LEN; m>>=1) {
-                        vsmem[tid] += vsmem[tid + m];
-                    }
-                }
-                if (tid < LEN)  tmp_gb[tid] += tmp_it[tid];
-#endif
             }
         }
 
