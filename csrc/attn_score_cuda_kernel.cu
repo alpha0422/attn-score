@@ -604,13 +604,22 @@ cunn_AttnScoreBackward(
     auto tmp_gk = tmp_gq + t_q * LEN;
     auto tmp_gb = tmp_gk + t_k * LEN;
     auto tmp_gl = tmp_gb + blockDim.x;
-    auto tmp_q = reinterpret_cast<scalar_t*>(tmp_gl + blockDim.x);
+    auto tmp_kk = tmp_gl + blockDim.x;
+    auto tmp_qq = tmp_kk + blockDim.x;
+    auto tmp_bb = tmp_qq + blockDim.x;
+    auto tmp_ll = tmp_bb + blockDim.x;
+    auto tmp_q = reinterpret_cast<scalar_t*>(tmp_ll + blockDim.x);
     auto tmp_k = tmp_q + t_q * LEN;
     auto tmp_b = tmp_k + t_k * LEN;
     auto tmp_l = tmp_b + LEN;
 
-    // initialize gradients to zero
+    // final reduce to LEN
     assert(LEN < blockDim.x);
+    // reduce 3D to 2D, assume one thread reduce same dim
+    assert(blockDim.x % (TILE * LEN) == 0);
+    assert((TILE * TILE * LEN) % blockDim.x == 0);
+
+    // initialize gradients to zero
     tmp_gl[threadIdx.x] = 0;
     tmp_gb[threadIdx.x] = 0;
 
@@ -660,39 +669,45 @@ cunn_AttnScoreBackward(
                     }
                     tmp_qk[k] = s;
                     tmp_it[k] = t;
-                    //if (blockIdx.x == 0)
-                    //    printf("%d:%d, %d:%d:%d:%d, %d:%d:%d, tmp_qk: %f\n",
-                    //        blockIdx.x, threadIdx.x, n, i, j, k, q_id, k_id, h_id,
-                    //        static_cast<float>(tmp_qk[k]));
                 }
 
                 __syncthreads();
 
                 // reduction on query and key gradients
-                for (int k=threadIdx.x; k<TILE*LEN; k+=blockDim.x) {
+                accscalar_t g_q = 0, g_k = 0, g_l = 0;
+                for (int k=threadIdx.x; k<TILE*TILE*LEN; k+=blockDim.x) {
                     int h_id = k % LEN;
-                    int qkid = k / LEN;
+                    int k_id = k / LEN % TILE;
+                    int q_id = k / (LEN * TILE);
 
-                    accscalar_t g_q = 0, g_k = 0, g_l = 0;
-
-                    #pragma unroll
-                    for (int m=0; m<TILE; m++) {
-                        //if (blockIdx.x == 0)
-                        //    printf("%d:%d, %d:%d:%d:%d:%d, g_q: %f, tmp_it[%d]: %f\n",
-                        //        blockIdx.x, threadIdx.x, n, i, j, k, m, g_q,
-                        //        m*TILE*LEN+qkid*LEN+h_id, 
-                        //        static_cast<float>(tmp_it[m*TILE*LEN+qkid*LEN+h_id]));
-                        g_q += tmp_it[qkid*TILE*LEN+m*LEN+h_id];
-                        g_k += tmp_it[m*TILE*LEN+qkid*LEN+h_id];
-                        g_l += tmp_qk[qkid*TILE*LEN+m*LEN+h_id];
-                    }
-                    
-                    if (i + qkid < t_q)  tmp_gq[(i+qkid)*LEN+h_id] += g_q;
-                    if (j + qkid < t_k)  tmp_gk[(j+qkid)*LEN+h_id] += g_k;
-                    tmp_gl[threadIdx.x] += g_l;
-                    tmp_gb[threadIdx.x] += 0.5f * (g_q + g_k);
+                    g_q += tmp_it[k_id*TILE*LEN+q_id*LEN+h_id];
+                    g_k += tmp_it[k];
+                    g_l += tmp_qk[k];
                 }
+                tmp_qq[threadIdx.x] = g_q;
+                tmp_kk[threadIdx.x] = g_k;
+                tmp_ll[threadIdx.x] = g_l;
                 __syncthreads();
+
+                for (int s=blockDim.x/2; s>=TILE*LEN; s>>=1) {
+                    if (threadIdx.x < s) {
+                        tmp_qq[threadIdx.x] += tmp_qq[threadIdx.x + s];
+                        tmp_kk[threadIdx.x] += tmp_kk[threadIdx.x + s];
+                        tmp_ll[threadIdx.x] += tmp_ll[threadIdx.x + s];
+                    }
+                    __syncthreads();
+                }
+
+                int h_id = threadIdx.x % LEN;
+                int qkid = threadIdx.x / LEN;
+                if (i + qkid < t_q && threadIdx.x < TILE * LEN)
+                    tmp_gq[(i+qkid)*LEN+h_id] += tmp_qq[threadIdx.x];
+                if (j + qkid < t_k && threadIdx.x < TILE * LEN)
+                    tmp_gk[(j+qkid)*LEN+h_id] += tmp_kk[threadIdx.x];
+                if (threadIdx.x < TILE * LEN)
+                    tmp_gb[threadIdx.x] += tmp_qq[threadIdx.x];
+                if (threadIdx.x < TILE * LEN)
+                    tmp_gl[threadIdx.x] += tmp_ll[threadIdx.x];
             }
         }
 
@@ -788,7 +803,7 @@ std::vector<at::Tensor> attn_score_backward_cuda(
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(attn_query.type(), "attn_score_bprop", [&] {
         using accscalar_t = acc_type<scalar_t, true>;
         cunn_AttnScoreBackward<LEN, TILE, BZ, scalar_t, accscalar_t, scalar_t>
-        <<<grid, block, (2*TILE*TILE + t_q + t_k + block.x) * LEN * sizeof(accscalar_t) +
+        <<<grid, block, ((2*TILE*TILE + t_q + t_k) * LEN + 6 * block.x) * sizeof(accscalar_t) +
             (t_q + t_k + 2) * LEN * sizeof(scalar_t) , stream>>>(
             grad_query.data<scalar_t>(), grad_keys.data<scalar_t>(),
             grad_bias.data<scalar_t>(), grad_lin.data<scalar_t>(),
