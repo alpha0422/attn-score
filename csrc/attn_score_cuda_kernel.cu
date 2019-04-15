@@ -742,12 +742,14 @@ cunn_AttnScoreBackward(
     __syncthreads();
     static_assert(LEN < 32, "LEN too large.");
     if (tid < 32) {
-        volatile accscalar_t *vsmem_gl = tmp_gl;
-        volatile accscalar_t *vsmem_gb = tmp_gb;
+        accscalar_t tl, tb;
         #pragma unroll
         for (int m=32; m>=LEN; m>>=1) {
-            vsmem_gl[tid] += vsmem_gl[tid + m];
-            vsmem_gb[tid] += vsmem_gb[tid + m];
+            tl = tmp_gl[tid] + tmp_gl[tid + m];
+            tb = tmp_gb[tid] + tmp_gb[tid + m];
+            __syncwarp();
+            tmp_gl[tid] = tl;
+            tmp_gb[tid] = tb;
         }
     }
     __syncthreads();
