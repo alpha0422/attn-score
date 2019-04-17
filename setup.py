@@ -10,7 +10,11 @@ setup(
         CUDAExtension('attn_score_cuda', [
             'csrc/attn_score_cuda.cpp',
             'csrc/attn_score_cuda_kernel.cu',
-        ])
+        ],
+        extra_compile_args={
+            'cxx': ['-O2',],
+            'nvcc':['--gpu-architecture=sm_70',]
+        })
     ],
     cmdclass={
         'build_ext': BuildExtension
