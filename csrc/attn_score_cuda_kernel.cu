@@ -3,16 +3,6 @@
 #include <ATen/AccumulateType.h>
 #include <THC/THC.h>
 
-#if 0
-#define DPRINTF(fmt, args...)                       \
-    do{                                             \
-        fprintf(stderr, "DEBUG: %s:%d:%s(): " fmt,  \
-            __FILE__, __LINE__, __func__, ##args);  \
-    } while(false)
-#else
-#define DPRINTF(fmt, args...) do{ } while (false)
-#endif
-
 /** Each block process TILE_Q*TILE_K*hidden volumn. */
 template <int TILE, typename scalar_t, typename accscalar_t, typename outscalar_t>
 __global__ void
@@ -74,7 +64,6 @@ cunn_AttnScoreForward(
                     tmp_k[j*blockDim.x+threadIdx.x] +
                     tmp_b[threadIdx.x]);
                 tmp_o[i*TILE*blockDim.x+j*blockDim.x+threadIdx.x] += tanhf(s) * tmp_l[threadIdx.x];
-                DPRINTF("threadVal: %d %d %f\n", i, j, tanhf(s) * tmp_l[threadIdx.x]);
             }
         }
     }
@@ -118,12 +107,10 @@ cunn_AttnScoreForward(
                     accscalar_t warpVal = static_cast<accscalar_t>(0);
                     #pragma unroll
                     for (int k = 0; k < 32; ++k) {
-                        DPRINTF("warpVal: %d %d %d %d %f %f\n", lane, i, j, k, tmp_o[i*TILE*blockDim.x+j*blockDim.x+lane*32+k], warpVal);
                         warpVal += tmp_o[i*TILE*blockDim.x+j*blockDim.x+lane*32+k];
                     }
                     __syncwarp(mask);
                     tmp_o[i*TILE*blockDim.x+j*blockDim.x+lane] = warpVal;
-                    DPRINTF("warpVal: %d %d %d %f\n", lane, i, j, warpVal);
                 }
             }
         }
@@ -140,7 +127,6 @@ cunn_AttnScoreForward(
                     blockVal += tmp_o[i*TILE*blockDim.x+j*blockDim.x+k];
                 }
                 output[(i+q_start)*t_k+(j+k_start)] = static_cast<outscalar_t>(blockVal);
-                DPRINTF("blockVal: %d %d %f\n", i, j, blockVal);
             }
         }
     }
