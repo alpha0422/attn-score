@@ -54,7 +54,7 @@ class AttentionScoreTest(unittest.TestCase):
         ref, tst = ref.flatten(), tst.flatten()
         diff = (ref - tst).abs().max()
         idx = (ref - tst).abs().argmax()
-        print("idx: {}, diff: {:.6f}, ref: {:.6f}, tst: {:.6f}".format(
+        print("Max diff: idx: {}, diff: {:.6f}, ref: {:.6f}, tst: {:.6f}".format(
             idx, diff, ref[idx], tst[idx]))
 
     def test_attn_score_function(self):
@@ -79,20 +79,20 @@ class AttentionScoreTest(unittest.TestCase):
             #    self.assertTrue(torch.allclose(t_ref.grad, t_tst.grad))
             norm_ref = sum([x.grad.float().norm() for x in inputs_ref])
             norm_tst = sum([x.grad.float().norm() for x in inputs_tst])
-            print("Ref norm:", end=' ')
+            print("Ref grad norm:", end=' ')
             for t in inputs_ref:
                 print("{:.8f}".format(t.grad.float().norm().item()), end=' ')
             print()
-            print("Tst norm:", end=' ')
+            print("Tst grad norm:", end=' ')
             for t in inputs_tst:
                 print("{:.8f}".format(t.grad.float().norm().item()), end=' ')
             print()
-            
+
             self.print_max_diff_elem(inputs_ref[3].grad, inputs_tst[3].grad)
             self.print_max_diff_elem(inputs_ref[2].grad, inputs_tst[2].grad)
             self.print_max_diff_elem(inputs_ref[1].grad, inputs_tst[1].grad)
             self.print_max_diff_elem(inputs_ref[0].grad, inputs_tst[0].grad)
-            
+
             self.assertTrue(abs(norm_ref - norm_tst) < 1e-3)
 
     def test_attn_score_perf(self):
@@ -103,6 +103,8 @@ class AttentionScoreTest(unittest.TestCase):
         torch.cuda.synchronize()
         ts_ref = time.time()
         for i in range(num_iters):
+            for tensor in inputs_ref:
+                tensor.grad = None
             score_ref = calc_score_ref(*inputs_ref)
             score_ref.backward(grads)
         torch.cuda.synchronize()
@@ -113,6 +115,8 @@ class AttentionScoreTest(unittest.TestCase):
         torch.cuda.synchronize()
         ts_jit = time.time()
         for i in range(num_iters):
+            for tensor in inputs_jit:
+                tensor.grad = None
             score_jit = calc_score_jit(*inputs_jit)
             score_jit.backward(grads)
         torch.cuda.synchronize()
@@ -123,6 +127,8 @@ class AttentionScoreTest(unittest.TestCase):
         torch.cuda.synchronize()
         ts_tst = time.time()
         for i in range(num_iters):
+            for tensor in inputs_tst:
+                tensor.grad = None
             score_tst = calc_score_tst(*inputs_tst)
             score_tst.backward(grads)
         torch.cuda.synchronize()
