@@ -524,42 +524,64 @@ std::vector<at::Tensor> attn_score_backward_cuda(
     at::Tensor grad_keys = at::empty_like(attn_keys);
 
     const int BZ = 2;
-    const int TILE = 16;
     const int THREADS = 128;
     const int ILP = sizeof(int4) / attn_query.element_size();
-    const int LEN = 8 * ILP;
+    const int len = (t_k <= 80) ? 8 * ILP : 4 * ILP;
 
-    assert(hidden % LEN == 0);
+    assert(hidden % len == 0);
 
-    // Each CTA process BZ*t_q*t_k*LEN volume
+    // Each CTA process BZ*t_q*t_k*len volume
     // Each thread process 1*1*1*int4 a time
     dim3 block(THREADS);
-    dim3 grid(((batch_sz+BZ-1)/BZ) * (hidden/LEN));
+    dim3 grid(((batch_sz+BZ-1)/BZ) * (hidden/len));
 
     // Allocate per-CTA buffer for future reduction on bias and linear_attn
-    at::Tensor grad_biases = at::empty({grid.x, LEN}, bias.options());
-    at::Tensor grad_lins = at::empty({grid.x, LEN}, linear_attn.options());
+    at::Tensor grad_biases = at::empty({grid.x, len}, bias.options());
+    at::Tensor grad_lins = at::empty({grid.x, len}, linear_attn.options());
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    cudaDeviceSynchronize();
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(attn_query.scalar_type(), "attn_score_bprop", [&] {
-        using accscalar_t = at::acc_type<scalar_t, true>;
-        using vector_t = vec_type<scalar_t, accscalar_t>;
-        cunn_AttnScoreBackward<THREADS, sizeof(int4) / sizeof(scalar_t),
-            8 * sizeof(int4) / sizeof(scalar_t), TILE, BZ,
-            scalar_t, accscalar_t, vector_t, scalar_t>
-        <<<grid, block, (TILE + (t_k + TILE - 1) / TILE * TILE) * LEN *
-            sizeof(accscalar_t) + (t_k + TILE - 1) / TILE * TILE * LEN *
-            sizeof(scalar_t), stream>>>(
-            grad_query.data<scalar_t>(), grad_keys.data<scalar_t>(),
-            grad_biases.data<scalar_t>(), grad_lins.data<scalar_t>(),
-            grad_output.data<scalar_t>(), attn_query.data<scalar_t>(),
-            attn_keys.data<scalar_t>(), bias.data<scalar_t>(),
-            linear_attn.data<scalar_t>(), batch_sz, t_q, t_k, hidden
-        );
-    });
-    cudaDeviceSynchronize();
+    if (t_k <= 80) {
+        const int TILE = 16;
+        const int THREADS_PER_LEN = 8;
+        const int LEN = THREADS_PER_LEN * ILP;
+        AT_DISPATCH_FLOATING_TYPES_AND_HALF(attn_query.scalar_type(), "attn_score_bprop", [&] {
+            using accscalar_t = at::acc_type<scalar_t, true>;
+            using vector_t = vec_type<scalar_t, accscalar_t>;
+            cunn_AttnScoreBackward<THREADS, sizeof(int4) / sizeof(scalar_t),
+                THREADS_PER_LEN * sizeof(int4) / sizeof(scalar_t), TILE, BZ,
+                scalar_t, accscalar_t, vector_t, scalar_t>
+            <<<grid, block, (TILE + (t_k + TILE - 1) / TILE * TILE) * LEN *
+                sizeof(accscalar_t) + (t_k + TILE - 1) / TILE * TILE * LEN *
+                sizeof(scalar_t), stream>>>(
+                grad_query.data<scalar_t>(), grad_keys.data<scalar_t>(),
+                grad_biases.data<scalar_t>(), grad_lins.data<scalar_t>(),
+                grad_output.data<scalar_t>(), attn_query.data<scalar_t>(),
+                attn_keys.data<scalar_t>(), bias.data<scalar_t>(),
+                linear_attn.data<scalar_t>(), batch_sz, t_q, t_k, hidden
+            );
+        });
+    } else {
+        const int TILE = 32;
+        const int THREADS_PER_LEN = 4;
+        const int LEN = THREADS_PER_LEN * ILP;
+        AT_DISPATCH_FLOATING_TYPES_AND_HALF(attn_query.scalar_type(), "attn_score_bprop", [&] {
+            using accscalar_t = at::acc_type<scalar_t, true>;
+            using vector_t = vec_type<scalar_t, accscalar_t>;
+            cunn_AttnScoreBackward<THREADS, sizeof(int4) / sizeof(scalar_t),
+                THREADS_PER_LEN * sizeof(int4) / sizeof(scalar_t), TILE, BZ,
+                scalar_t, accscalar_t, vector_t, scalar_t>
+            <<<grid, block, (TILE + (t_k + TILE - 1) / TILE * TILE) * LEN *
+                sizeof(accscalar_t) + (t_k + TILE - 1) / TILE * TILE * LEN *
+                sizeof(scalar_t), stream>>>(
+                grad_query.data<scalar_t>(), grad_keys.data<scalar_t>(),
+                grad_biases.data<scalar_t>(), grad_lins.data<scalar_t>(),
+                grad_output.data<scalar_t>(), attn_query.data<scalar_t>(),
+                attn_keys.data<scalar_t>(), bias.data<scalar_t>(),
+                linear_attn.data<scalar_t>(), batch_sz, t_q, t_k, hidden
+            );
+        });
+    }
 
     // Reduce bias and linear_attn gradients
     at::Tensor grad_bias = at::sum(grad_biases.view({-1, hidden}), 0);
