@@ -24,44 +24,38 @@ template<typename T, typename U>
 using vec_type = typename VectorType<T, U>::type;
 
 // Convert int4 data to corresponding to vector type
-void __device__ __inline__ int4ToVector(float8 *dst, int4 *src) {
-    at::Half *src_t = reinterpret_cast<at::Half *>(src);
-    dst->x0 = static_cast<float>(src_t[0]);
-    dst->x1 = static_cast<float>(src_t[1]);
-    dst->x2 = static_cast<float>(src_t[2]);
-    dst->x3 = static_cast<float>(src_t[3]);
-    dst->x4 = static_cast<float>(src_t[4]);
-    dst->x5 = static_cast<float>(src_t[5]);
-    dst->x6 = static_cast<float>(src_t[6]);
-    dst->x7 = static_cast<float>(src_t[7]);
+void __device__ __inline__ int4ToVector(float8 *dst, int4 &src) {
+    float8 result;
+    #pragma unroll
+    for(int i=0; i<4; i++) {
+        *((float2*)(&result)+i) = __half22float2(*((__half2*)(&src)+i));
+    }
+    *dst = result;
 }
-void __device__ __inline__ int4ToVector(float4 *dst, int4 *src) {
-    float4 *src_t = reinterpret_cast<float4 *>(src);
+void __device__ __inline__ int4ToVector(float4 *dst, int4 &src) {
+    float4 *src_t = reinterpret_cast<float4 *>(&src);
     *dst = *src_t;
 }
-void __device__ __inline__ int4ToVector(double2 *dst, int4 *src) {
-    double2 *src_t = reinterpret_cast<double2 *>(src);
+void __device__ __inline__ int4ToVector(double2 *dst, int4 &src) {
+    double2 *src_t = reinterpret_cast<double2 *>(&src);
     *dst = *src_t;
 }
 
 // Convert vector type to int4
-void __device__ __inline__ vectorToInt4(int4 *dst, float8 *src) {
-    at::Half *dst_t = reinterpret_cast<at::Half *>(dst);
-    dst_t[0] = static_cast<at::Half>(src->x0);
-    dst_t[1] = static_cast<at::Half>(src->x1);
-    dst_t[2] = static_cast<at::Half>(src->x2);
-    dst_t[3] = static_cast<at::Half>(src->x3);
-    dst_t[4] = static_cast<at::Half>(src->x4);
-    dst_t[5] = static_cast<at::Half>(src->x5);
-    dst_t[6] = static_cast<at::Half>(src->x6);
-    dst_t[7] = static_cast<at::Half>(src->x7);
+void __device__ __inline__ vectorToInt4(int4 *dst, float8 &src) {
+    int4 result;
+    #pragma unroll
+    for(int i=0;i<4;i++) {
+        *((__half2*)(&result)+i) = __float22half2_rn(*((float2*)(&src)+i));
+    }
+    *dst = result;
 }
-void __device__ __inline__ vectorToInt4(int4 *dst, float4 *src) {
-    int4 *src_t = reinterpret_cast<int4 *>(src);
+void __device__ __inline__ vectorToInt4(int4 *dst, float4 &src) {
+    int4 *src_t = reinterpret_cast<int4 *>(&src);
     *dst = *src_t;
 }
-void __device__ __inline__ vectorToInt4(int4 *dst, double2 *src) {
-    int4 *src_t = reinterpret_cast<int4 *>(src);
+void __device__ __inline__ vectorToInt4(int4 *dst, double2 &src) {
+    int4 *src_t = reinterpret_cast<int4 *>(&src);
     *dst = *src_t;
 }
 
@@ -99,7 +93,6 @@ cunn_AttnScoreForward(
 
     // ilpReduce
     int offset = tid;
-    int last = hidden % THREADS;
     scalar_t tmp_q[TILE], tmp_k[TILE], tmp_b, tmp_l;
     for (; offset < hidden; offset += THREADS) {
         // prolog: load query slices to shared memory
@@ -269,8 +262,10 @@ cunn_AttnScoreBackward(
     // assume one thread process the same hidden id
     static_assert(THREADS % (LEN / ILP) == 0, "Expect one thread process the same hidden index.");
     vector_t tmp_b, tmp_l;
-    int4ToVector(&tmp_b, (int4*)(&bias[h_offset]));
-    int4ToVector(&tmp_l, (int4*)(&linear_attn[h_offset]));
+    int4 bias_int4 = *(int4*)&bias[h_offset];
+    int4 linear_attn_int4 = *(int4*)&linear_attn[h_offset];
+    int4ToVector(&tmp_b, bias_int4);
+    int4ToVector(&tmp_l, linear_attn_int4);
 
     // initialize bias and linear_attn gradients to zero
     vector_t tmp_gb = {0}, tmp_gl = {0};
@@ -297,20 +292,22 @@ cunn_AttnScoreBackward(
             // initialize gradients of query to zero
             int q_id = tile_q + tid / (LEN / ILP);
             vector_t tmp_q = {0}, tmp_gq = {0};
-            if (q_id < t_q)
-                int4ToVector(&tmp_q, (int4*)&attn_query[q_id*hidden + h_offset]);
+            if (q_id < t_q) {
+                int4 attn_query_int4 = *(int4*)&attn_query[q_id*hidden + h_offset];
+                int4ToVector(&tmp_q, attn_query_int4);
+            }
 
             // loop each tile along key dimension
             for (int tile_k=0; tile_k<t_ku; tile_k+=TILE) {
                 // load per thread g_o of shape TILE to registers
                 accscalar_t tmp_go[TILE] = {0};
                 if (q_id < t_q) {
+                    // grad_o might be mis-aligned
                     const scalar_t *grad_o = grad_output + q_id * t_k + tile_k;
                     if (tile_k < t_kd) {
                         #pragma unroll
-                        for (int i=0; i<TILE/ILP; i++) {
-                            int4ToVector(&((vector_t *)tmp_go)[i],
-                                (int4*)&grad_o[i*ILP]);
+                        for (int i=0; i<TILE; i++) {
+                            tmp_go[i] = static_cast<accscalar_t>(grad_o[i]);
                         }
                     } else {
                         for (int i=0; i<t_k-t_kd; i++) {
@@ -325,7 +322,8 @@ cunn_AttnScoreBackward(
                     // load per thread k and g_k to registers
                     vector_t tmp_k_r;
                     int idx = k * LEN + h_offset;
-                    int4ToVector(&tmp_k_r, (int4*)&tmp_k[idx]);
+                    int4 tmp_k_int4 = *(int4*)&tmp_k[idx];
+                    int4ToVector(&tmp_k_r, tmp_k_int4);
                  
                     accscalar_t t;
                     vector_t g_qk = {0};
@@ -385,7 +383,7 @@ cunn_AttnScoreBackward(
             // store g_q to global memory
             // accumulate partial g_b using g_q
             if (q_id < t_q) {
-                vectorToInt4((int4*)&grad_query[q_id*hidden + h_offset], &tmp_gq);
+                vectorToInt4((int4*)&grad_query[q_id*hidden + h_offset], tmp_gq);
                 #pragma unroll
                 for (int i=0; i<ILP; i++) {
                     *((accscalar_t *)(&tmp_gb)+i) += *((accscalar_t *)(&tmp_gq)+i);
@@ -396,7 +394,7 @@ cunn_AttnScoreBackward(
         // store g_k to global memory
         for (int i=tid*ILP; i<t_k*LEN; i+=THREADS*ILP) {
             vectorToInt4((int4*)&grad_key[i/LEN*hidden + (i&(LEN-1))],
-                (vector_t*)&tmp_gk[i]);
+                *(vector_t*)&tmp_gk[i]);
         }
 
         // update pointer for next batch
@@ -458,8 +456,8 @@ cunn_AttnScoreBackward(
 
     // store per CTA g_b, g_l to global memory
     if (tid < LEN / ILP) {
-        vectorToInt4((int4*)&grad_biases[h_offset], (vector_t*)&smem_gb[h_offset]);
-        vectorToInt4((int4*)&grad_lins[h_offset], (vector_t*)&smem_gl[h_offset]);
+        vectorToInt4((int4*)&grad_biases[h_offset], *(vector_t*)&smem_gb[h_offset]);
+        vectorToInt4((int4*)&grad_lins[h_offset], *(vector_t*)&smem_gl[h_offset]);
     }
     __syncthreads();
 }
